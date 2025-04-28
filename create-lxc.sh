@@ -10,7 +10,7 @@ set -e
 set -o pipefail
 set -x
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 LOGFILE="./create-lxc-$(date '+%Y-%m-%d').log"
 
 log() {
