@@ -1,29 +1,59 @@
 # Proxmox LXC Creator
 
-A Bash script to automate creating Linux Containers (LXC) in a Proxmox VE environment.
+A modular Bash script for **automated, flexible, and reliable LXC container creation** across multi-node Proxmox VE clusters.
+
+This script is designed to:
+- Dynamically fetch available templates (local NFS and Proxmox public)
+- Prompt interactively for critical container settings
+- Configure networking and hostname inside containers after creation
+- Support both **Debian** and **Ubuntu** containers reliably
+- Write full timestamped logs for auditing and troubleshooting
+- Follow clean, production-safe scripting practices
+
+---
 
 ## Features
-- Pulls available templates from both local NFS and Proxmox remote repository
-- Filters templates to only default or standard (no turnkey/appliance)
-- Offers to auto-download missing templates
-- Fully interactive prompts for Node, CTID, Name, Storage, and Template
-- Validates CTID uniqueness
-- Supports version tracking (`--version`)
-- Verbose logging to timestamped log files
-- Configuration via simple `.env` file
 
-## Requirements
-- Proxmox VE 7.x or 8.x
-- Bash shell
-- `pvesh`, `pct`, and `pveam` available
+- ✅ Dynamic Node Selection
+- ✅ Dynamic Template Listing (Local + Remote)
+- ✅ Storage Selection (lvmthin and NFS)
+- ✅ CTID Validation
+- ✅ Clean Container Naming (short name only)
+- ✅ CPU / RAM / Disk Customization
+- ✅ DHCP or Static IP Networking (VLAN support)
+- ✅ Privileged / Unprivileged Container Choice
+- ✅ Root Password Prompt (with confirmation)
+- ✅ Post-creation Networking Configuration:
+  - Ubuntu: Netplan YAML creation + apply
+  - Debian: Ensure `/etc/network/interfaces` exists, bring up eth0
+- ✅ Internal Hostname Setting (`hostnamectl`)
+- ✅ Full Timestamped Logging
+- ✅ Distro Neutral (Debian and Ubuntu tested)
+- ✅ GitHub-Ready Codebase
 
-## License
-Licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).
+---
 
-## Usage
-1. Copy `.env.example` to `.env` and adjust settings.
-2. Run the script:
+## Environment Variables
+
+Configure a `.env` file or modify the provided `env-template`:
+
 ```bash
-chmod +x create-lxc.sh
-./create-lxc.sh
+# Example .env
 
+# Comma-separated DNS servers
+DEFAULT_DNS="192.168.1.10,192.168.20.10"
+
+# Storage where templates are stored (must be NFS)
+TEMPLATE_STORAGE="proxmox-templates"
+
+# Storage for container root disks
+NFS_STORAGE="proxmox-vmstore"
+
+# Default network bridge
+DEFAULT_BRIDGE="vmbr0"
+
+# Domain suffix to append to internal hostnames
+HOSTNAME_SUFFIX="ad.cgillett.com"
+
+# SSH public key to inject (optional)
+SSH_PUBLIC_KEY=""

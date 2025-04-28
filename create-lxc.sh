@@ -59,12 +59,12 @@ check_cancel() {
 
 # Function to get available nodes
 get_nodes() {
-    pvesh get /nodes | jq -r '.[].node'
+    pvesh get /nodes --output-format=json | jq -r '.[].node'
 }
 
 # Function to list local templates from NFS
 list_local_templates() {
-    pvesm list "$TEMPLATE_STORAGE" | awk '/vztmpl/ {print $1, $2}' | grep -E 'default|standard' | awk '{print $2}'
+    pvesm list "$TEMPLATE_STORAGE" | awk '$2 == "vztmpl" {print $3}'
 }
 
 # Function to list remote templates from Proxmox
@@ -96,12 +96,18 @@ validate_ip() {
 # Select Node
 select_node() {
     log "Fetching available nodes..."
-    NODES=($(get_nodes))
-    if [[ ${#NODES[@]} -eq 0 ]]; then
+    RAW_NODES=($(get_nodes))
+    if [[ ${#RAW_NODES[@]} -eq 0 ]]; then
         log "ERROR: No nodes found."
         exit 1
     fi
-    NODE=$(whiptail --title "Select Proxmox Node" --menu "Choose a node:" 15 60 5 "${NODES[@]}" 3>&1 1>&2 2>&3)
+
+    NODE_MENU=()
+    for node in "${RAW_NODES[@]}"; do
+        NODE_MENU+=("$node" "Node $node")
+    done
+
+    NODE=$(whiptail --title "Select Proxmox Node" --menu "Choose a node:" 15 60 5 "${NODE_MENU[@]}" 3>&1 1>&2 2>&3)
     check_cancel
     log "Selected node: $NODE"
 }
@@ -114,23 +120,17 @@ select_template() {
     TEMPLATES=("${LOCAL_TEMPLATES[@]}")
     for remote in "${REMOTE_TEMPLATES[@]}"; do
         if [[ ! " ${LOCAL_TEMPLATES[*]} " =~ " $remote " ]]; then
-            TEMPLATES+=("$remote (remote)")
+            TEMPLATES+=("$remote")  # No (remote) label anymore
         fi
     done
 
-    TEMPLATE=$(whiptail --title "Select Template" --menu "Choose a container template:" 20 78 10 "${TEMPLATES[@]}" 3>&1 1>&2 2>&3)
-    check_cancel
+    TEMPLATE_MENU=()
+    for template in "${TEMPLATES[@]}"; do
+        TEMPLATE_MENU+=("$template" "")
+    done
 
-    if [[ "$TEMPLATE" == *"(remote)"* ]]; then
-        TEMPLATE_NAME="${TEMPLATE%% *}"
-        if whiptail --title "Download Template" --yesno "Template $TEMPLATE_NAME not found locally. Download it now?" 10 60; then
-            pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"
-            TEMPLATE="$TEMPLATE_NAME"
-        else
-            log "User cancelled template download. Exiting."
-            exit 1
-        fi
-    fi
+    TEMPLATE=$(whiptail --title "Select Template" --menu "Choose a container template:" 20 78 10 "${TEMPLATE_MENU[@]}" 3>&1 1>&2 2>&3)
+    check_cancel
     log "Selected template: $TEMPLATE"
 }
 
@@ -146,10 +146,16 @@ select_storage() {
 
     AVAILABLE_STORAGES+=("$NFS_STORAGE")
 
-    STORAGE=$(whiptail --title "Select Storage" --menu "Choose container storage:" 20 78 10 "${AVAILABLE_STORAGES[@]}" 3>&1 1>&2 2>&3)
+    STORAGE_MENU=()
+    for storage in "${AVAILABLE_STORAGES[@]}"; do
+        STORAGE_MENU+=("$storage" "")
+    done
+
+    STORAGE=$(whiptail --title "Select Storage" --menu "Choose container storage:" 20 78 10 "${STORAGE_MENU[@]}" 3>&1 1>&2 2>&3)
     check_cancel
     log "Selected Storage: $STORAGE"
 }
+
 
 # Ask for CTID
 ask_ctid() {
@@ -346,22 +352,52 @@ create_container() {
         PRIV_FLAG=1
     fi
 
+    # Create the container
     pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
-    -hostname "$HOSTNAME" \
-    -storage "$STORAGE" \
-    -cores "$CPU_CORES" \
-    -memory "$MEMORY_MB" \
-    -net0 "$NET_CONFIG" \
-    -rootfs "$STORAGE:$DISK_GB" \
-    -password "$ROOT_PASSWORD" \
-    -unprivileged "$((1 - PRIV_FLAG))" \
-    --features "nesting=1" \
-    --ostype unmanaged \
-    --start 1
+      -hostname "$HOSTNAME" \
+      -storage "$STORAGE" \
+      -cores "$CPU_CORES" \
+      -memory "$MEMORY_MB" \
+      -net0 "$NET_CONFIG" \
+      -rootfs "$STORAGE:$DISK_GB" \
+      -password "$ROOT_PASSWORD" \
+      -unprivileged "$((1 - PRIV_FLAG))" \
+      --features "nesting=1" \
+      --ostype unmanaged \
+      --start 1
+
+    # Set the internal container hostname cleanly
+    log "Setting container hostname internally..."
+    pct exec "$CTID" -- hostnamectl set-hostname "$NAME"
+
+    # Detect OS inside container
+    log "Detecting OS inside container..."
+    OS_ID=$(pct exec "$CTID" -- bash -c "source /etc/os-release && echo \$ID")
+    log "Detected OS: $OS_ID"
+
+    if [[ "$OS_ID" == "ubuntu" ]]; then
+        log "Configuring Netplan for Ubuntu container networking..."
+        pct exec "$CTID" -- bash -c 'mkdir -p /etc/netplan && echo -e "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true" > /etc/netplan/01-netcfg.yaml'
+        pct exec "$CTID" -- netplan apply
+    elif [[ "$OS_ID" == "debian" ]]; then
+        log "Checking if /etc/network/interfaces exists inside Debian container..."
+        if ! pct exec "$CTID" -- grep -q "iface eth0" /etc/network/interfaces; then
+            log "Creating minimal /etc/network/interfaces inside container..."
+            pct exec "$CTID" -- bash -c 'echo -e "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp" > /etc/network/interfaces'
+        else
+            log "/etc/network/interfaces already exists and eth0 configured."
+        fi
+        log "Bringing up eth0 inside Debian container..."
+        pct exec "$CTID" -- bash -c 'ifup eth0 || systemctl restart networking'
+    else
+        log "WARNING: Unknown OS type ($OS_ID). Networking config skipped."
+    fi
 
     log "Container $CTID created successfully."
     echo "Container $CTID ($NAME) has been created and started."
 }
+
+
 
 # ========== MAIN SCRIPT ==========
 
