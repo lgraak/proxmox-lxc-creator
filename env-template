@@ -1,0 +1,19 @@
+# Example environment configuration
+
+# Comma-separated DNS servers for containers
+DEFAULT_DNS="192.168.1.10,192.168.20.10"
+
+# NFS Storage where templates are stored
+TEMPLATE_STORAGE="proxmox-templates"
+
+# NFS Storage for container rootfs
+NFS_STORAGE="proxmox-nfs-containers"
+
+# Default network bridge
+DEFAULT_BRIDGE="vmbr0"
+
+# Optional hostname domain suffix
+HOSTNAME_SUFFIX=""
+
+# Optional SSH public key to insert into container
+SSH_PUBLIC_KEY=""
