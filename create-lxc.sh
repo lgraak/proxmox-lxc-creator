@@ -1,8 +1,8 @@
 #!/bin/bash
 # create-lxc.sh
-# Version: 0.1.0
+# Version: 0.2.0
 #
-# Proxmox LXC Creator - Partial Working Prototype
+# Proxmox LXC Creator - Full Working Version (Phase 2)
 # Licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
 # https://creativecommons.org/licenses/by-nc/4.0/
 
@@ -10,7 +10,7 @@ set -e
 set -o pipefail
 set -x
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 LOGFILE="./create-lxc-$(date '+%Y-%m-%d').log"
 
 log() {
@@ -44,6 +44,19 @@ done
 HOSTNAME_SUFFIX="${HOSTNAME_SUFFIX:-}" # optional
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"   # optional
 
+# Check dependencies
+command -v pvesh >/dev/null 2>&1 || { echo >&2 "pvesh not found. Is this a Proxmox server? Aborting."; exit 1; }
+command -v pveam >/dev/null 2>&1 || { echo >&2 "pveam not found. Is this a Proxmox server? Aborting."; exit 1; }
+command -v whiptail >/dev/null 2>&1 || { echo >&2 "whiptail not installed. Install it first: apt install whiptail"; exit 1; }
+
+# Utility function to exit cleanly on cancel
+check_cancel() {
+    if [[ $? -ne 0 ]]; then
+        log "User canceled. Exiting."
+        exit 1
+    fi
+}
+
 # Function to get available nodes
 get_nodes() {
     pvesh get /nodes | jq -r '.[].node'
@@ -64,6 +77,22 @@ ctid_exists() {
     pct list | awk 'NR>1 {print $1}' | grep -q "^$1$"
 }
 
+# Function to validate an IP address
+validate_ip() {
+    local ip=$1
+    local stat=1
+
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        OIFS=$IFS
+        IFS='.'
+        ip=($ip)
+        IFS=$OIFS
+        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+        stat=$?
+    fi
+    return $stat
+}
+
 # Select Node
 select_node() {
     log "Fetching available nodes..."
@@ -72,17 +101,10 @@ select_node() {
         log "ERROR: No nodes found."
         exit 1
     fi
-    echo "Select Proxmox Node:"
-    select NODE in "${NODES[@]}"; do
-        if [[ -n "$NODE" ]]; then
-            log "Selected node: $NODE"
-            break
-        else
-            echo "Invalid selection."
-        fi
-    done
+    NODE=$(whiptail --title "Select Proxmox Node" --menu "Choose a node:" 15 60 5 "${NODES[@]}" 3>&1 1>&2 2>&3)
+    check_cancel
+    log "Selected node: $NODE"
 }
-
 # Select Template
 select_template() {
     log "Fetching templates..."
@@ -91,67 +113,29 @@ select_template() {
 
     TEMPLATES=("${LOCAL_TEMPLATES[@]}")
     for remote in "${REMOTE_TEMPLATES[@]}"; do
-        # Only add remote templates that aren't local
         if [[ ! " ${LOCAL_TEMPLATES[*]} " =~ " $remote " ]]; then
             TEMPLATES+=("$remote (remote)")
         fi
     done
 
-    echo "Select a template:"
-    select TEMPLATE in "${TEMPLATES[@]}"; do
-        if [[ -n "$TEMPLATE" ]]; then
-            if [[ "$TEMPLATE" == *"(remote)"* ]]; then
-                TEMPLATE_NAME="${TEMPLATE%% *}"
-                echo "Template not found locally. Download it?"
-                select yn in "Yes" "No"; do
-                    case $yn in
-                        Yes ) pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"; break;;
-                        No ) log "Template download cancelled. Exiting."; exit 1;;
-                    esac
-                done
-                TEMPLATE="$TEMPLATE_NAME"
-            fi
-            log "Selected template: $TEMPLATE"
-            break
+    TEMPLATE=$(whiptail --title "Select Template" --menu "Choose a container template:" 20 78 10 "${TEMPLATES[@]}" 3>&1 1>&2 2>&3)
+    check_cancel
+
+    if [[ "$TEMPLATE" == *"(remote)"* ]]; then
+        TEMPLATE_NAME="${TEMPLATE%% *}"
+        if whiptail --title "Download Template" --yesno "Template $TEMPLATE_NAME not found locally. Download it now?" 10 60; then
+            pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"
+            TEMPLATE="$TEMPLATE_NAME"
         else
-            echo "Invalid selection."
+            log "User cancelled template download. Exiting."
+            exit 1
         fi
-    done
+    fi
+    log "Selected template: $TEMPLATE"
 }
 
-# Ask for CTID
-ask_ctid() {
-    while true; do
-        read -rp "Enter CTID (numeric, unused): " CTID
-        if [[ "$CTID" =~ ^[0-9]+$ ]]; then
-            if ctid_exists "$CTID"; then
-                echo "CTID $CTID already exists. Choose another."
-            else
-                log "Selected CTID: $CTID"
-                break
-            fi
-        else
-            echo "Invalid CTID. Must be a number."
-        fi
-    done
-}
-
-# Ask for Container Name
-ask_name() {
-    while true; do
-        read -rp "Enter container name (no spaces, lowercase recommended): " NAME
-        NAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')
-        if [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{1,30}$ ]]; then
-            log "Container name: $NAME"
-            break
-        else
-            echo "Invalid name. Use lowercase letters, numbers, and hyphens only."
-        fi
-    done
-}
-
-# Ask for Storage
-ask_storage() {
+# Select Storage
+select_storage() {
     AVAILABLE_STORAGES=()
     while IFS= read -r storage; do
         type=$(pvesm status --storage "$storage" | awk 'NR>1 {print $2}')
@@ -162,32 +146,241 @@ ask_storage() {
 
     AVAILABLE_STORAGES+=("$NFS_STORAGE")
 
-    echo "Select Storage:"
-    select STORAGE in "${AVAILABLE_STORAGES[@]}"; do
-        if [[ -n "$STORAGE" ]]; then
-            log "Selected Storage: $STORAGE"
-            break
+    STORAGE=$(whiptail --title "Select Storage" --menu "Choose container storage:" 20 78 10 "${AVAILABLE_STORAGES[@]}" 3>&1 1>&2 2>&3)
+    check_cancel
+    log "Selected Storage: $STORAGE"
+}
+
+# Ask for CTID
+ask_ctid() {
+    while true; do
+        CTID=$(whiptail --inputbox "Enter CTID (numeric, unused):" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$CTID" =~ ^[0-9]+$ ]]; then
+            if ctid_exists "$CTID"; then
+                whiptail --msgbox "CTID already exists. Choose another." 8 45
+            else
+                log "Selected CTID: $CTID"
+                break
+            fi
         else
-            echo "Invalid selection."
+            whiptail --msgbox "Invalid CTID. Must be numeric." 8 45
         fi
     done
 }
 
-# ========== MAIN LOGIC ==========
+# Ask for Container Name
+ask_name() {
+    while true; do
+        NAME=$(whiptail --inputbox "Enter container name (lowercase, no spaces):" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        NAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')
+        if [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{1,30}$ ]]; then
+            log "Container name: $NAME"
+            break
+        else
+            whiptail --msgbox "Invalid name. Use lowercase letters, numbers, and hyphens only." 8 60
+        fi
+    done
+}
+
+# Ask for CPU
+ask_cpu() {
+    while true; do
+        CPU_CORES=$(whiptail --inputbox "Enter number of CPU cores:" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$CPU_CORES" =~ ^[0-9]+$ && "$CPU_CORES" -ge 1 ]]; then
+            log "Selected CPU cores: $CPU_CORES"
+            break
+        else
+            whiptail --msgbox "Invalid CPU value. Must be a positive number." 8 45
+        fi
+    done
+}
+
+# Ask for RAM
+ask_ram() {
+    while true; do
+        MEMORY_MB=$(whiptail --inputbox "Enter Memory (MB):" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$MEMORY_MB" =~ ^[0-9]+$ && "$MEMORY_MB" -ge 128 ]]; then
+            log "Selected Memory: $MEMORY_MB MB"
+            break
+        else
+            whiptail --msgbox "Invalid memory value. Must be at least 128 MB." 8 45
+        fi
+    done
+}
+
+# Ask for Disk Size
+ask_disk() {
+    while true; do
+        DISK_GB=$(whiptail --inputbox "Enter Disk Size (GB) - minimum 8GB recommended:" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$DISK_GB" =~ ^[0-9]+$ && "$DISK_GB" -ge 8 ]]; then
+            log "Selected Disk Size: $DISK_GB GB"
+            break
+        else
+            whiptail --msgbox "Invalid disk size. Must be a number, at least 8GB." 8 45
+        fi
+    done
+}
+# Ask for Networking Type (DHCP or Static)
+ask_network_type() {
+    if whiptail --title "Networking" --yesno "Use DHCP for networking?" 10 60; then
+        USE_DHCP=true
+        log "Networking: DHCP"
+    else
+        USE_DHCP=false
+        log "Networking: Static"
+    fi
+}
+
+# Ask for Static IP Details
+ask_static_ip() {
+    if [ "$USE_DHCP" = false ]; then
+        while true; do
+            STATIC_IP=$(whiptail --inputbox "Enter Static IP Address (e.g., 192.168.1.100):" 10 60 3>&1 1>&2 2>&3)
+            check_cancel
+            if validate_ip "$STATIC_IP"; then
+                break
+            else
+                whiptail --msgbox "Invalid IP address." 8 45
+            fi
+        done
+
+        while true; do
+            CIDR=$(whiptail --inputbox "Enter Subnet CIDR (e.g., 24 for 255.255.255.0):" 10 60 3>&1 1>&2 2>&3)
+            check_cancel
+            if [[ "$CIDR" =~ ^[0-9]+$ && "$CIDR" -ge 8 && "$CIDR" -le 32 ]]; then
+                break
+            else
+                whiptail --msgbox "Invalid CIDR. Must be between 8 and 32." 8 45
+            fi
+        done
+
+        while true; do
+            GATEWAY=$(whiptail --inputbox "Enter Gateway IP:" 10 60 3>&1 1>&2 2>&3)
+            check_cancel
+            if validate_ip "$GATEWAY"; then
+                break
+            else
+                whiptail --msgbox "Invalid Gateway IP." 8 45
+            fi
+        done
+    fi
+}
+
+# Ask for VLAN ID
+ask_vlan() {
+    while true; do
+        VLAN_ID=$(whiptail --inputbox "Enter VLAN ID (1-4094):" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$VLAN_ID" =~ ^[0-9]+$ && "$VLAN_ID" -ge 1 && "$VLAN_ID" -le 4094 ]]; then
+            log "Selected VLAN: $VLAN_ID"
+            break
+        else
+            whiptail --msgbox "Invalid VLAN ID. Must be 1-4094." 8 45
+        fi
+    done
+}
+
+# Ask for Privileged or Unprivileged
+ask_privilege() {
+    PRIVILEGE=$(whiptail --title "Container Type" --menu "Choose container type:" 15 60 4 \
+    "unprivileged" "Recommended for security" \
+    "privileged" "Full container access" \
+    3>&1 1>&2 2>&3)
+    check_cancel
+    log "Selected container type: $PRIVILEGE"
+}
+
+# Ask for Root Password
+ask_password() {
+    while true; do
+        PASSWORD1=$(whiptail --passwordbox "Enter Root Password:" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        PASSWORD2=$(whiptail --passwordbox "Confirm Root Password:" 10 60 3>&1 1>&2 2>&3)
+        check_cancel
+        if [[ "$PASSWORD1" == "$PASSWORD2" ]]; then
+            ROOT_PASSWORD="$PASSWORD1"
+            log "Root password confirmed."
+            break
+        else
+            whiptail --msgbox "Passwords do not match. Please try again." 8 45
+        fi
+    done
+}
+
+# Final Confirmation
+final_confirm() {
+    SUMMARY="Node: $NODE\nTemplate: $TEMPLATE\nCTID: $CTID\nName: $NAME\nStorage: $STORAGE\nCPU: $CPU_CORES\nMemory: $MEMORY_MB MB\nDisk: $DISK_GB GB\nNetworking: "
+    if [ "$USE_DHCP" = true ]; then
+        SUMMARY+="DHCP\n"
+    else
+        SUMMARY+="Static IP $STATIC_IP/$CIDR, Gateway $GATEWAY\n"
+    fi
+    SUMMARY+="VLAN ID: $VLAN_ID\nContainer Type: $PRIVILEGE"
+    whiptail --title "Confirm Settings" --yesno "$SUMMARY\n\nProceed with container creation?" 20 78
+    check_cancel
+}
+
+# Create the container
+create_container() {
+    log "Creating container..."
+
+    HOSTNAME="$NAME"
+    if [[ -n "$HOSTNAME_SUFFIX" ]]; then
+        HOSTNAME="$NAME.$HOSTNAME_SUFFIX"
+    fi
+
+    NET_CONFIG="name=eth0,bridge=$DEFAULT_BRIDGE,tag=$VLAN_ID"
+    if [ "$USE_DHCP" = true ]; then
+        NET_CONFIG+=",ip=dhcp"
+    else
+        NET_CONFIG+=",ip=${STATIC_IP}/${CIDR},gw=${GATEWAY}"
+    fi
+
+    PRIV_FLAG=0
+    if [[ "$PRIVILEGE" == "privileged" ]]; then
+        PRIV_FLAG=1
+    fi
+
+    pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
+    -hostname "$HOSTNAME" \
+    -storage "$STORAGE" \
+    -cores "$CPU_CORES" \
+    -memory "$MEMORY_MB" \
+    -net0 "$NET_CONFIG" \
+    -rootfs "$STORAGE:$DISK_GB" \
+    -password "$ROOT_PASSWORD" \
+    -unprivileged "$((1 - PRIV_FLAG))" \
+    --features "nesting=1" \
+    --ostype unmanaged \
+    --start 1
+
+    log "Container $CTID created successfully."
+    echo "Container $CTID ($NAME) has been created and started."
+}
+
+# ========== MAIN SCRIPT ==========
 
 log "Starting Proxmox LXC Creator Script v$VERSION"
 select_node
 select_template
 ask_ctid
 ask_name
-ask_storage
+select_storage
+ask_cpu
+ask_ram
+ask_disk
+ask_network_type
+ask_static_ip
+ask_vlan
+ask_privilege
+ask_password
+final_confirm
+create_container
 
-log "User selections complete."
-log "Node: $NODE | Template: $TEMPLATE | CTID: $CTID | Name: $NAME | Storage: $STORAGE"
-
-# (Placeholder for future steps: CPU, RAM, Disk Size, Networking, Passwords, pct create)
-
-log "Partial working script finished. Exiting."
-
+log "Script completed. Exiting."
 exit 0
-
