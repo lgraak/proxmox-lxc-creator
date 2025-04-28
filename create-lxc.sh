@@ -8,7 +8,6 @@
 
 set -e
 set -o pipefail
-set -x
 
 VERSION="0.2.0"
 LOGFILE="./create-lxc-$(date '+%Y-%m-%d').log"
@@ -117,21 +116,64 @@ select_template() {
     LOCAL_TEMPLATES=($(list_local_templates))
     REMOTE_TEMPLATES=($(list_remote_templates))
 
-    TEMPLATES=("${LOCAL_TEMPLATES[@]}")
-    for remote in "${REMOTE_TEMPLATES[@]}"; do
-        if [[ ! " ${LOCAL_TEMPLATES[*]} " =~ " $remote " ]]; then
-            TEMPLATES+=("$remote")  # No (remote) label anymore
+    # Combine local and remote templates
+    TEMPLATES=()
+    TEMPLATE_SOURCE=() # Matches the TEMPLATES array, "local" or "remote"
+
+    # Add local templates
+    for template in "${LOCAL_TEMPLATES[@]}"; do
+        if [[ "$template" =~ debian || "$template" =~ ubuntu || "$template" =~ rockylinux ]]; then
+            TEMPLATES+=("$template")
+            TEMPLATE_SOURCE+=("local")
         fi
     done
 
+    # Add remote templates (only if not already present locally)
+    for remote in "${REMOTE_TEMPLATES[@]}"; do
+        if [[ "$remote" =~ debian || "$remote" =~ ubuntu || "$remote" =~ rockylinux ]]; then
+            if [[ ! " ${LOCAL_TEMPLATES[*]} " =~ " $remote " ]]; then
+                TEMPLATES+=("$remote")
+                TEMPLATE_SOURCE+=("remote")
+            fi
+        fi
+    done
+
+    # Build menu list for Whiptail
     TEMPLATE_MENU=()
     for template in "${TEMPLATES[@]}"; do
         TEMPLATE_MENU+=("$template" "")
     done
 
-    TEMPLATE=$(whiptail --title "Select Template" --menu "Choose a container template:" 20 78 10 "${TEMPLATE_MENU[@]}" 3>&1 1>&2 2>&3)
+    # Prompt user to select template
+    SELECTED_TEMPLATE=$(whiptail --title "Select Template" --menu "Choose a container template:" 20 78 10 "${TEMPLATE_MENU[@]}" 3>&1 1>&2 2>&3)
     check_cancel
-    log "Selected template: $TEMPLATE"
+    log "Selected template: $SELECTED_TEMPLATE"
+
+    # Find the index of the selected template
+    SELECTED_INDEX=-1
+    for i in "${!TEMPLATES[@]}"; do
+        if [[ "${TEMPLATES[$i]}" == "$SELECTED_TEMPLATE" ]]; then
+            SELECTED_INDEX="$i"
+            break
+        fi
+    done
+
+    # Check if the selected template is remote
+    if [[ "${TEMPLATE_SOURCE[$SELECTED_INDEX]}" == "remote" ]]; then
+        log "Selected template is remote. Prompting to download..."
+        if whiptail --yesno "Template '$SELECTED_TEMPLATE' is not stored locally.\n\nWould you like to download it now?" 12 60; then
+            log "Downloading template..."
+            pveam download "$TEMPLATE_STORAGE" "$SELECTED_TEMPLATE"
+            log "Template downloaded successfully."
+        else
+            log "User chose not to download the template. Aborting."
+            echo "Template download cancelled. Exiting."
+            exit 1
+        fi
+    fi
+
+    # Set final TEMPLATE variable to the user's selected template
+    TEMPLATE="$SELECTED_TEMPLATE"
 }
 
 # Select Storage
@@ -335,6 +377,7 @@ final_confirm() {
 create_container() {
     log "Creating container..."
 
+    # Build FQDN for inside the container
     HOSTNAME="$NAME"
     if [[ -n "$HOSTNAME_SUFFIX" ]]; then
         HOSTNAME="$NAME.$HOSTNAME_SUFFIX"
@@ -352,9 +395,9 @@ create_container() {
         PRIV_FLAG=1
     fi
 
-    # Create the container
+    # Create the container with SHORT hostname (not FQDN)
     pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
-      -hostname "$HOSTNAME" \
+      -hostname "$NAME" \
       -storage "$STORAGE" \
       -cores "$CPU_CORES" \
       -memory "$MEMORY_MB" \
@@ -366,11 +409,9 @@ create_container() {
       --ostype unmanaged \
       --start 1
 
-    # Set the internal container hostname cleanly
-    log "Setting container hostname internally..."
-    pct exec "$CTID" -- hostnamectl set-hostname "$NAME"
+    log "Setting container internal hostname to FQDN ($HOSTNAME)..."
+    pct exec "$CTID" -- hostnamectl set-hostname "$HOSTNAME"
 
-    # Detect OS inside container
     log "Detecting OS inside container..."
     OS_ID=$(pct exec "$CTID" -- bash -c "source /etc/os-release && echo \$ID")
     log "Detected OS: $OS_ID"
@@ -378,7 +419,16 @@ create_container() {
     if [[ "$OS_ID" == "ubuntu" ]]; then
         log "Configuring Netplan for Ubuntu container networking..."
         pct exec "$CTID" -- bash -c 'mkdir -p /etc/netplan && echo -e "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true" > /etc/netplan/01-netcfg.yaml'
-        pct exec "$CTID" -- netplan apply
+
+        log "Checking if systemd-networkd is active before applying Netplan..."
+        if pct exec "$CTID" -- systemctl is-active --quiet systemd-networkd; then
+            log "systemd-networkd is active. Applying Netplan..."
+            pct exec "$CTID" -- netplan apply
+            log "Netplan applied successfully."
+        else
+            log "systemd-networkd is NOT active. Skipping Netplan apply inside container."
+        fi
+
     elif [[ "$OS_ID" == "debian" ]]; then
         log "Checking if /etc/network/interfaces exists inside Debian container..."
         if ! pct exec "$CTID" -- grep -q "iface eth0" /etc/network/interfaces; then
@@ -396,6 +446,7 @@ create_container() {
     log "Container $CTID created successfully."
     echo "Container $CTID ($NAME) has been created and started."
 }
+
 
 
 
